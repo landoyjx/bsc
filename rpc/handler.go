@@ -93,7 +93,7 @@ func newHandler(connCtx context.Context, conn jsonWriter, idgen func() ID, reg *
 }
 
 // handleBatch executes all messages in a batch and returns the responses.
-func (h *handler) handleBatch(msgs []*jsonrpcMessage) {
+func (h *handler) handleBatch(ctx context.Context, msgs []*jsonrpcMessage) {
 	// Emit error response for empty batches:
 	if len(msgs) == 0 {
 		h.startCallProc(func(cp *callProc) {
@@ -116,7 +116,7 @@ func (h *handler) handleBatch(msgs []*jsonrpcMessage) {
 	h.startCallProc(func(cp *callProc) {
 		answers := make([]*jsonrpcMessage, 0, len(msgs))
 		for _, msg := range calls {
-			if answer := h.handleCallMsg(cp, msg); answer != nil {
+			if answer := h.handleCallMsg(cp, ctx, msg); answer != nil {
 				answers = append(answers, answer)
 			}
 		}
@@ -131,12 +131,12 @@ func (h *handler) handleBatch(msgs []*jsonrpcMessage) {
 }
 
 // handleMsg handles a single message.
-func (h *handler) handleMsg(msg *jsonrpcMessage) {
+func (h *handler) handleMsg(ctx context.Context, msg *jsonrpcMessage) {
 	if ok := h.handleImmediate(msg); ok {
 		return
 	}
 	h.startCallProc(func(cp *callProc) {
-		answer := h.handleCallMsg(cp, msg)
+		answer := h.handleCallMsg(cp, ctx, msg)
 		h.addSubscriptions(cp.notifiers)
 		if answer != nil {
 			h.conn.writeJSON(cp.ctx, answer)
@@ -189,7 +189,7 @@ func (h *handler) cancelAllRequests(err error, inflightReq *requestOp) {
 	}
 	for id, sub := range h.clientSubs {
 		delete(h.clientSubs, id)
-		sub.quitWithError(false, err)
+		sub.close(err)
 	}
 }
 
@@ -281,13 +281,13 @@ func (h *handler) handleResponse(msg *jsonrpcMessage) {
 		return
 	}
 	if op.err = json.Unmarshal(msg.Result, &op.sub.subid); op.err == nil {
-		go op.sub.start()
+		go op.sub.run()
 		h.clientSubs[op.sub.subid] = op.sub
 	}
 }
 
 // handleCallMsg executes a call message and returns the answer.
-func (h *handler) handleCallMsg(ctx *callProc, msg *jsonrpcMessage) *jsonrpcMessage {
+func (h *handler) handleCallMsg(ctx *callProc, reqCtx context.Context, msg *jsonrpcMessage) *jsonrpcMessage {
 	start := time.Now()
 	switch {
 	case msg.isNotification():
@@ -296,10 +296,19 @@ func (h *handler) handleCallMsg(ctx *callProc, msg *jsonrpcMessage) *jsonrpcMess
 		return nil
 	case msg.isCall():
 		resp := h.handleCall(ctx, msg)
+		var ctx []interface{}
+		ctx = append(ctx, "reqid", idForLog{msg.ID}, "t", time.Since(start))
 		if resp.Error != nil {
-			h.log.Warn("Served "+msg.Method, "reqid", idForLog{msg.ID}, "t", time.Since(start), "err", resp.Error.Message)
+			xForward := reqCtx.Value("X-Forwarded-For")
+			h.log.Warn("Served "+msg.Method, "reqid", idForLog{msg.ID}, "t", time.Since(start), "err", resp.Error.Message, "X-Forwarded-For", xForward)
+
+			ctx = append(ctx, "err", resp.Error.Message)
+			if resp.Error.Data != nil {
+				ctx = append(ctx, "errdata", resp.Error.Data)
+			}
+			h.log.Warn("Served "+msg.Method, ctx...)
 		} else {
-			h.log.Debug("Served "+msg.Method, "reqid", idForLog{msg.ID}, "t", time.Since(start))
+			h.log.Debug("Served "+msg.Method, ctx...)
 		}
 		return resp
 	case msg.hasValidID():
@@ -339,7 +348,8 @@ func (h *handler) handleCall(cp *callProc, msg *jsonrpcMessage) *jsonrpcMessage 
 		} else {
 			successfulRequestGauge.Inc(1)
 		}
-		rpcServingTimer.UpdateSince(start)
+		RpcServingTimer.UpdateSince(start)
+		newRPCRequestGauge(msg.Method).Inc(1)
 		newRPCServingTimer(msg.Method, answer.Error == nil).UpdateSince(start)
 	}
 	return answer

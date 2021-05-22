@@ -36,7 +36,7 @@ const (
 	// OptionMethodInvocation is an indication that the codec supports RPC method calls
 	OptionMethodInvocation CodecOption = 1 << iota
 
-	// OptionSubscriptions is an indication that the codec suports RPC notifications
+	// OptionSubscriptions is an indication that the codec supports RPC notifications
 	OptionSubscriptions = 1 << iota // support pub sub
 )
 
@@ -109,9 +109,9 @@ func (s *Server) serveSingleRequest(ctx context.Context, codec ServerCodec) {
 		return
 	}
 	if batch {
-		h.handleBatch(reqs)
+		h.handleBatch(ctx, reqs)
 	} else {
-		h.handleMsg(reqs[0])
+		h.handleMsg(ctx, reqs[0])
 	}
 }
 
